@@ -49,11 +49,6 @@ def extract_init_string(blob: str) -> str:
     return s
 
 
-def wrap_init_json(init_string: str) -> str:
-    inner = extract_init_string(init_string)
-    return json.dumps({"InitString": inner}, separators=(",", ":"))
-
-
 def check_if_valid_init_string(
     encoded: str,
     decoded: str,
@@ -147,5 +142,4 @@ __all__ = [
     "decode_init_string",
     "check_if_valid_init_string",
     "extract_init_string",
-    "wrap_init_json",
 ]

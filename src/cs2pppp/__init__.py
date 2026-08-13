@@ -35,7 +35,6 @@ from .errors import (
     ConfigError,
     Cs2Error,
     DirectoryError,
-    ProtocolError,
     SessionError,
 )
 from .framing import encode_json, extract_json_strings
@@ -115,6 +114,5 @@ __all__ = [
     "ConfigError",
     "DirectoryError",
     "SessionError",
-    "ProtocolError",
     "AuthError",
 ]

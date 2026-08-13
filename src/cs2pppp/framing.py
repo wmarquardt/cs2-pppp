@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import struct
 import time
-from typing import Dict, Iterable, List, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 MAGIC = 0xAFAFAFA0
 TRAILER = 0xF1F2F3F4
@@ -106,10 +106,6 @@ def local_timezone_hours() -> int:
     return int(off // 3600)
 
 
-def iter_json_blobs(chunks: Iterable[bytes]) -> List[str]:
-    return extract_json_strings(b"".join(chunks))
-
-
 __all__ = [
     "MAGIC",
     "TRAILER",
@@ -119,5 +115,4 @@ __all__ = [
     "try_decode_frame",
     "extract_json_strings",
     "local_timezone_hours",
-    "iter_json_blobs",
 ]

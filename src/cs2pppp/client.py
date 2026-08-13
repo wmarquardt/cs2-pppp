@@ -86,9 +86,6 @@ class Cs2Client:
         )
         return sess
 
-    # ``connect`` is an alias of ``session``.
-    connect = session
-
     def device(
         self,
         did: str,

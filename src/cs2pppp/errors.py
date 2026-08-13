@@ -20,10 +20,6 @@ class SessionError(Cs2Error):
     session was detected instead of a real device."""
 
 
-class ProtocolError(Cs2Error):
-    """Malformed frame or unexpected wire data."""
-
-
 class AuthError(Cs2Error):
     """LoginDev rejected the supplied password."""
 
@@ -33,6 +29,5 @@ __all__ = [
     "ConfigError",
     "DirectoryError",
     "SessionError",
-    "ProtocolError",
     "AuthError",
 ]
