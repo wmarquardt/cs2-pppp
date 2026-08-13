@@ -102,6 +102,8 @@ with client.device("G100000ZKMNP", password="123456") as dev:
     info = dev.get_info()          # dict from GetDevInfo (+ related)
     # dev.login()                  # already done if password given at open
     # dev.snapshot("out.jpg")      # optional; needs ffmpeg on PATH
+    # files = dev.list_tf_videos() # TF/SD card recordings
+    # dev.download_tf_file(files[0], "clip.mov")
 
 # Low-level session
 with client.session("G100000ZKMNP") as sess:
@@ -110,6 +112,29 @@ with client.session("G100000ZKMNP") as sess:
     sess.send_json({"cmd": "LoginDev", "pwd": "123456"})
     raw = sess.recv(timeout=2.0)
 ```
+
+## TF / SD card videos
+
+List and download recordings stored on the camera card (CS2-style app JSON):
+
+```python
+from cs2pppp import list_tf_videos, download_tf_file
+
+with client.device("G100000ZKMNP", password="123456") as dev:
+    items = dev.list_tf_videos()           # page starts at 1; bare or envelope JSON
+    for it in items:
+        print(it.name, it.size_bytes, it.patch)
+    if items:
+        dev.download_tf_file(items[0], f"/tmp/{items[0].name}")
+```
+
+Notes from live RE:
+
+- List command: `GetTfVideoList` with `page` / `count` (apps often use **1-based** pages).
+- Many firmwares stream **one bare JSON object per file** (`name`, `patch`, `size`,
+  `time`) — not a single envelope with `cmd=GetTfVideoList`. Filtering replies by
+  that command name drops all items.
+- Download: `DownloadFile` on DRW channel 1, file bytes on **channel 3**.
 
 The relay path is preferred by default (direct hole-punch often fails on CGNAT).
 Pass `prefer="direct"` to try the direct punch first.

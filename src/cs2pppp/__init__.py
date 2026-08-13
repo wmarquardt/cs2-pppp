@@ -43,9 +43,21 @@ from .initstring import DecodedInit, decode_init_string
 from .probe import probe
 from .session import PeerEndpoint, PpppSession
 from .status import ProbeResult, Status
+from .tf import (
+    TfDownloadResult,
+    TfPreviewResult,
+    TfVideoItem,
+    download_tf_file,
+    list_tf_videos,
+    parse_tf_list_payload,
+    parse_tf_list_replies,
+    playback_tf_file,
+    resolve_tf_item,
+    tf_preview_frame,
+)
 from ._tables import clear_tables, configure_tables
 
-__version__ = "0.1.0"
+__version__ = "0.2.4"
 
 __all__ = [
     "__version__",
@@ -55,6 +67,17 @@ __all__ = [
     "Device",
     "PpppSession",
     "PeerEndpoint",
+    # TF / SD card
+    "TfVideoItem",
+    "TfDownloadResult",
+    "TfPreviewResult",
+    "list_tf_videos",
+    "download_tf_file",
+    "tf_preview_frame",
+    "playback_tf_file",
+    "resolve_tf_item",
+    "parse_tf_list_payload",
+    "parse_tf_list_replies",
     # probe / status
     "probe",
     "ProbeResult",

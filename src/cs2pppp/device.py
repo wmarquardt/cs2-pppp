@@ -6,15 +6,23 @@ directory servers. All commands ride the CS2 app JSON channel.
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import subprocess
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from .did import to_real
 from .errors import AuthError, SessionError
 from .session import PpppSession
+from .tf import (
+    TfDownloadResult,
+    TfPreviewResult,
+    TfVideoItem,
+    download_tf_file,
+    list_tf_videos,
+    tf_preview_frame,
+)
 
 logger = logging.getLogger("cs2pppp")
 
@@ -103,6 +111,61 @@ class Device:
         """Send an arbitrary app-channel command; parsed JSON replies."""
         return self.session.request_json(obj, **kw)
 
+    # --- TF / SD card recordings ------------------------------------------
+
+    def list_tf_videos(
+        self,
+        *,
+        page_size: int = 30,
+        read_timeout: float = 12.0,
+        max_pages: int = 200,
+        start_page: int = 1,
+    ) -> List[TfVideoItem]:
+        """List recordings on the device TF/SD card (``GetTfVideoList``)."""
+        return list_tf_videos(
+            self.session,
+            page_size=page_size,
+            read_timeout=read_timeout,
+            max_pages=max_pages,
+            start_page=start_page,
+        )
+
+    def download_tf_file(
+        self,
+        item: TfVideoItem,
+        dest: Union[str, Path],
+        *,
+        password: Optional[str] = None,
+        progress: Optional[Callable[[int, int, float], None]] = None,
+    ) -> TfDownloadResult:
+        """Download one TF file to ``dest`` (``DownloadFile`` + DRW channel 3)."""
+        pwd = self.password if password is None else password
+        return download_tf_file(
+            self.session,
+            item,
+            Path(dest),
+            password=pwd or "",
+            progress=progress,
+        )
+
+    def tf_preview(
+        self,
+        item: TfVideoItem,
+        dest_jpg: Union[str, Path],
+        *,
+        password: Optional[str] = None,
+        seconds: float = 3.5,
+    ) -> TfPreviewResult:
+        """One JPEG from TF playback (``PlaybackFile`` + channel 0). Needs ffmpeg."""
+        pwd = self.password if password is None else password
+        return tf_preview_frame(
+            self.session,
+            item,
+            Path(dest_jpg),
+            password=pwd or "",
+            seconds=seconds,
+        )
+
     # --- snapshot (optional; needs system ffmpeg) -------------------------
 
     def snapshot(self, out_path: str, *, stream: int = 0, seconds: float = 6.0) -> str:
@@ -165,4 +228,10 @@ def _extract_hevc(buf: bytes) -> bytes:
     return bytes(out)
 
 
-__all__ = ["Device", "INFO_COMMANDS"]
+__all__ = [
+    "Device",
+    "INFO_COMMANDS",
+    "TfVideoItem",
+    "TfDownloadResult",
+    "TfPreviewResult",
+]
