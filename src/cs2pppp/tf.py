@@ -599,25 +599,35 @@ def collect_stream_channel(
     channel: int = CHANNEL_STREAM,
     seconds: float = 4.0,
     stop_on_keyframe: bool = False,
+    give_up_no_keyframe_after: Optional[float] = None,
+    min_keyframe_bytes: int = 24_000,
 ) -> Tuple[bytes, List[str], int]:
     """ACK DRW and accumulate payloads for one channel for ``seconds``.
 
     If ``stop_on_keyframe``, return early once a full HEVC VPS+SPS+PPS+IDR AU
-    is present (after media-header strip).
+    is present (after media-header strip) **and** AU size has stopped growing
+    (multi-slice frames need a short settle window — otherwise only the top
+    of the picture decodes).
+
+    If ``give_up_no_keyframe_after`` is set and that much time has passed with
+    stream data but still no keyframe AU, return early (fail-fast for previews).
     """
     if not sess.sock or not sess.peer:
         raise SessionError("session not open")
     blobs: List[bytes] = []
     jsons: List[str] = []
     n_drw = 0
-    deadline = time.time() + max(seconds, 0.5)
+    t0 = time.time()
+    deadline = t0 + max(seconds, 0.5)
     last_alive = 0.0
+    au_len = 0
+    au_stable_deadline: Optional[float] = None
     while time.time() < deadline:
         now = time.time()
         if now - last_alive > 0.8:
             sess._send(header(MSG_ALIVE, 0), (sess.peer.ip, sess.peer.port))  # noqa: SLF001
             last_alive = now
-        for data, addr in sess._recv(0.35):  # noqa: SLF001
+        for data, addr in sess._recv(0.25):  # noqa: SLF001
             if len(data) < 2 or data[0] != MAGIC:
                 continue
             t = data[1]
@@ -653,7 +663,24 @@ def collect_stream_channel(
             elif t == MSG_CLOSE:
                 break
         if stop_on_keyframe and blobs:
-            if extract_hevc_keyframe_au(b"".join(blobs)):
+            joined = b"".join(blobs)
+            au = extract_hevc_keyframe_au(joined)
+            if au and len(au) >= min_keyframe_bytes:
+                if len(au) > au_len:
+                    au_len = len(au)
+                    # keep collecting briefly — multi-slice IDR trails arrive late
+                    au_stable_deadline = time.time() + 0.40
+                elif (
+                    au_stable_deadline is not None
+                    and time.time() >= au_stable_deadline
+                ):
+                    break
+            elif (
+                give_up_no_keyframe_after is not None
+                and (time.time() - t0) >= give_up_no_keyframe_after
+                and len(joined) > 8000
+            ):
+                # stream is flowing but not a clean keyframe AU — bail early
                 break
     return b"".join(blobs), jsons, n_drw
 
@@ -761,18 +788,22 @@ def extract_hevc_annexb(data: bytes) -> bytes:
 
 
 def extract_hevc_keyframe_au(data: bytes) -> bytes:
-    """Extract one HEVC access unit: VPS+SPS+PPS (+SEI) + first IDR/CRA slice.
+    """Extract one HEVC access unit: VPS+SPS+PPS (+SEI) + full keyframe picture.
 
     Prefer the **latest** complete parameter set + keyframe in the buffer so
     we decode a real picture instead of a lone VPS / mid-stream P-slice
     (green/corrupt JPEGs).
+
+    After the first IDR/CRA NAL, include **all consecutive VCL slices** of the
+    same picture (multi-slice / tiled HEVC). Stopping at the first IDR NAL
+    yields half-frame white-bottom artifacts on many cameras.
     """
     clean = strip_media_frame_headers(data)
     nals = _iter_annexb_nals(clean)
     if not nals:
         return b""
 
-    # HEVC types: 32 VPS, 33 SPS, 34 PPS, 39/40 SEI, 19/20 IDR, 21 CRA
+    # HEVC: 32 VPS, 33 SPS, 34 PPS, 39/40 SEI; VCL 0–31; KEY 19/20 IDR, 21 CRA
     KEY = {19, 20, 21}
     best: Optional[bytes] = None
     i = 0
@@ -800,10 +831,15 @@ def extract_hevc_keyframe_au(data: bytes) -> bytes:
             k += 1
         if has_sps and has_pps and k < len(nals) and nals[k][1] in KEY:
             start = nals[vps_i][0]
-            end = nals[k][2]
-            # include a little trailing data of the IDR NAL only
+            # multi-slice: keep trailing VCL NALs of this picture
+            end_i = k
+            m = k + 1
+            while m < len(nals) and nals[m][1] <= 31:
+                end_i = m
+                m += 1
+            end = nals[end_i][2]
             best = clean[start:end]
-            i = k + 1
+            i = end_i + 1
             continue
         i += 1
     return best or b""
@@ -935,22 +971,15 @@ def _jpeg_from_downloaded_file(
         raise SessionError(f"ffmpeg thumbnail failed: {err or 'no jpeg'}")
 
 
-def jpeg_looks_corrupt(
+def _jpeg_rgb_sample(
     path: Path,
     *,
     ffmpeg: Optional[str] = None,
-    green_ratio: float = 0.28,
-    sample_stride: int = 8,
-) -> bool:
-    """Return True if JPEG looks like a green/corrupt decode artifact.
-
-    Samples RGB via ffmpeg rawvideo. A frame is "green" when many pixels have
-    G significantly above R and B (classic missing-reference HEVC garbage).
-    """
+) -> Optional[bytes]:
     ff = ffmpeg or find_ffmpeg()
     if not ff or not Path(path).is_file() or Path(path).stat().st_size < 200:
-        return True
-    # Decode to a small RGB frame for sampling
+        return None
+    # Scale down for fast band stats (full 1080p RGB is heavy).
     cmd = [
         ff,
         "-hide_banner",
@@ -960,6 +989,8 @@ def jpeg_looks_corrupt(
         str(path),
         "-frames:v",
         "1",
+        "-vf",
+        "scale=160:90",
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -968,12 +999,31 @@ def jpeg_looks_corrupt(
     ]
     r = subprocess.run(cmd, capture_output=True, timeout=30, check=False)
     rgb = r.stdout or b""
-    if r.returncode != 0 or len(rgb) < 300:
+    if r.returncode != 0 or len(rgb) < 160 * 90 * 3:
+        return None
+    return rgb[: 160 * 90 * 3]
+
+
+def jpeg_looks_corrupt(
+    path: Path,
+    *,
+    ffmpeg: Optional[str] = None,
+    green_ratio: float = 0.28,
+    sample_stride: int = 1,
+) -> bool:
+    """Return True if JPEG looks like a green/corrupt/half-frame decode artifact.
+
+    Detects:
+      * green-dominant garbage (classic missing-ref HEVC)
+      * almost all dark
+      * bottom half flat (white/pink void) while top has real content —
+        incomplete multi-slice IDR (only top of picture decoded)
+    """
+    rgb = _jpeg_rgb_sample(path, ffmpeg=ffmpeg)
+    if rgb is None:
         return True
-    # Assume roughly square-ish; we only need relative channel stats
-    n = len(rgb) // 3
-    if n < 100:
-        return True
+    w, h = 160, 90
+    n = w * h
     greenish = 0
     dark = 0
     checked = 0
@@ -989,10 +1039,40 @@ def jpeg_looks_corrupt(
             greenish += 1
     if checked == 0:
         return True
-    # mostly flat green, or almost all dark (failed decode)
     if dark / checked > 0.85:
         return True
-    return (greenish / checked) >= green_ratio
+    if (greenish / checked) >= green_ratio:
+        return True
+
+    # Half-frame: bottom band nearly flat + bright, top has more variance.
+    def band_stats(y0: int, y1: int) -> Tuple[float, float, float]:
+        """Return (mean_luma, variance proxy, flat_ratio)."""
+        vals: List[int] = []
+        for y in range(y0, y1):
+            row = y * w * 3
+            for x in range(0, w, 2):
+                o = row + x * 3
+                vals.append(rgb[o] + rgb[o + 1] + rgb[o + 2])
+        if not vals:
+            return 0.0, 0.0, 1.0
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        # "flat" pixels near the band mean (void / solid fill)
+        flat = sum(1 for v in vals if abs(v - mean) < 45) / len(vals)
+        return mean, var, flat
+
+    top_m, top_v, _ = band_stats(0, h // 3)
+    mid_m, mid_v, mid_flat = band_stats(h // 3, 2 * h // 3)
+    bot_m, bot_v, bot_flat = band_stats(2 * h // 3, h)
+    # Incomplete multi-slice IDR: lower half is a flat bright void while
+    # the upper half still has real texture (see previews with white bottoms).
+    if bot_flat > 0.78 and bot_m > 350 and top_v > 1500:
+        if bot_v < 3000 or bot_v < top_v * 0.12:
+            return True
+    # Cut-line mid-frame: mid band chaotic, bottom solid void
+    if mid_v > 20_000 and bot_flat > 0.85 and bot_m > 500 and bot_v < 4000:
+        return True
+    return False
 
 
 def accept_or_reject_jpeg(
@@ -1000,14 +1080,16 @@ def accept_or_reject_jpeg(
     *,
     ffmpeg: Optional[str] = None,
 ) -> None:
-    """Raise SessionError and delete file if JPEG looks corrupt/green."""
+    """Raise SessionError and delete file if JPEG looks corrupt/green/half."""
     p = Path(path)
     if jpeg_looks_corrupt(p, ffmpeg=ffmpeg):
         try:
             p.unlink()
         except OSError:
             pass
-        raise SessionError("rejected green/corrupt JPEG (no clean keyframe)")
+        raise SessionError(
+            "rejected incomplete/corrupt JPEG (half-frame or green keyframe)"
+        )
 
 
 def tf_preview_frame(
@@ -1018,23 +1100,66 @@ def tf_preview_frame(
     password: str = "",
     user_id: int = 1,
     pos: int = 0,
-    seconds: float = 6.0,
+    seconds: float = 3.0,
     ffmpeg: Optional[str] = None,
     download_fallback: bool = True,
-    download_timeout_s: float = 45.0,
+    max_download_bytes: Optional[int] = None,
+    download_timeout_s: float = 90.0,
+    local_file_candidates: Optional[List[Path]] = None,
+    keep_download_path: Optional[Path] = None,
+    skip_green_check: bool = False,
+    progress: Optional[ProgressCb] = None,
 ) -> TfPreviewResult:
     """One JPEG for a TF clip.
 
-    1. Prefer ``PlaybackFile`` + ch0 keyframe (fast when stream is clean).
-    2. If that fails and ``download_fallback``, download the file via ch3 and
-       extract a frame with ffmpeg (slower, usually correct colour / no green).
+    Order:
+      1. Reuse a complete local file if provided (instant thumbnail).
+      2. ``PlaybackFile`` + ch0, fail-fast if no keyframe (~``seconds``).
+      3. Optional full-file download fallback (needed on many cams where
+         PlaybackFile stream never yields a clean keyframe). Slow on relay.
+
+    ``max_download_bytes``: if set, skip download when ``item.size_bytes`` is
+    larger (``None`` = always allow — default). Pass a path in
+    ``keep_download_path`` to retain the MOV (e.g. under ``videos/``) so the
+    next preview hits step 1.
     """
     dest_jpg = Path(dest_jpg)
     patch = item.patch
     raw = b""
     play_err: Optional[str] = None
+    ff = ffmpeg or find_ffmpeg()
 
-    # Clear leftover from previous clip
+    # --- 1) local cache (e.g. prior videos/ download) ----------------------
+    if local_file_candidates:
+        for cand in local_file_candidates:
+            cp = Path(cand)
+            if (
+                cp.is_file()
+                and cp.stat().st_size >= max(1000, min(item.size_bytes or 0, 1000))
+                and (item.size_bytes <= 0 or cp.stat().st_size >= item.size_bytes * 0.95)
+            ):
+                try:
+                    _jpeg_from_downloaded_file(cp, dest_jpg, ffmpeg=ff)
+                    if not skip_green_check:
+                        # file-based decode is usually clean; light check only
+                        if jpeg_looks_corrupt(dest_jpg, ffmpeg=ff, green_ratio=0.45):
+                            dest_jpg.unlink(missing_ok=True)  # type: ignore[arg-type]
+                            raise SessionError("local thumbnail looked corrupt")
+                    return TfPreviewResult(
+                        item=item,
+                        action="previewed",
+                        path=str(dest_jpg.resolve()),
+                        bytes_stream=cp.stat().st_size,
+                        codec="local",
+                    )
+                except Exception:
+                    try:
+                        if dest_jpg.is_file():
+                            dest_jpg.unlink()
+                    except OSError:
+                        pass
+
+    # --- 2) PlaybackFile (fast path) --------------------------------------
     try:
         playback_tf_file(
             sess, patch, password=password, user_id=user_id, pos=0, state=0
@@ -1042,7 +1167,7 @@ def tf_preview_frame(
     except Exception:
         pass
     try:
-        drain_stream_channel(sess, channel=CHANNEL_STREAM, seconds=0.6)
+        drain_stream_channel(sess, channel=CHANNEL_STREAM, seconds=0.15)
     except Exception:
         pass
 
@@ -1050,15 +1175,18 @@ def tf_preview_frame(
         playback_tf_file(
             sess, patch, password=password, user_id=user_id, pos=pos, state=1
         )
-        time.sleep(0.2)
+        time.sleep(0.12)
         playback_tf_file(
             sess, patch, password=password, user_id=user_id, pos=pos, state=1
         )
         raw, _jsons, _n = collect_stream_channel(
             sess,
             channel=CHANNEL_STREAM,
-            seconds=seconds,
+            seconds=max(seconds, 4.0),
             stop_on_keyframe=True,
+            # need a full multi-slice IDR; fail-fast only if stream is garbage
+            give_up_no_keyframe_after=min(3.5, max(2.0, seconds * 0.75)),
+            min_keyframe_bytes=24_000,
         )
     except Exception as e:
         play_err = str(e)
@@ -1071,7 +1199,7 @@ def tf_preview_frame(
         except Exception:
             pass
         try:
-            drain_stream_channel(sess, channel=CHANNEL_STREAM, seconds=0.5)
+            drain_stream_channel(sess, channel=CHANNEL_STREAM, seconds=0.15)
         except Exception:
             pass
 
@@ -1079,14 +1207,15 @@ def tf_preview_frame(
         clean = strip_media_frame_headers(raw)
         codec = sniff_annexb_codec(clean) or sniff_annexb_codec(raw)
         try:
-            stream_to_jpeg(raw, dest_jpg, ffmpeg=ffmpeg, codec=codec)
-            accept_or_reject_jpeg(dest_jpg, ffmpeg=ffmpeg)
+            stream_to_jpeg(raw, dest_jpg, ffmpeg=ff, codec=codec)
+            if not skip_green_check:
+                accept_or_reject_jpeg(dest_jpg, ffmpeg=ff)
             return TfPreviewResult(
                 item=item,
                 action="previewed",
                 path=str(dest_jpg.resolve()),
                 bytes_stream=len(raw),
-                codec=codec,
+                codec=codec or "hevc",
             )
         except Exception as e:
             play_err = str(e)
@@ -1096,7 +1225,18 @@ def tf_preview_frame(
             except OSError:
                 pass
 
-    if not download_fallback:
+    # --- 3) download fallback (full file; optional size skip) -------------
+    allow_dl = download_fallback
+    if allow_dl and max_download_bytes is not None:
+        if item.size_bytes > 0 and item.size_bytes > max_download_bytes:
+            allow_dl = False
+            play_err = (
+                f"{play_err or 'no keyframe'}; "
+                f"skip download ({item.size_bytes} B > max_download_bytes "
+                f"{max_download_bytes})"
+            )
+
+    if not allow_dl:
         return TfPreviewResult(
             item=item,
             action="failed",
@@ -1104,10 +1244,15 @@ def tf_preview_frame(
             error=play_err or "playback preview failed",
         )
 
-    # Fallback: full DownloadFile then first frame (reliable for .MOV on disk)
-    tmp = dest_jpg.with_suffix(dest_jpg.suffix + ".dl.tmp")
+    keep = Path(keep_download_path) if keep_download_path else None
+    tmp = (
+        keep
+        if keep is not None
+        else dest_jpg.with_suffix(dest_jpg.suffix + ".dl.tmp")
+    )
+    # Resume if keep path is a partial previous download.
     try:
-        if tmp.is_file():
+        if keep is None and tmp.is_file():
             tmp.unlink()
         dl = download_tf_file(
             sess,
@@ -1115,6 +1260,7 @@ def tf_preview_frame(
             tmp,
             password=password,
             no_data_timeout=max(download_timeout_s, 20.0),
+            progress=progress,
         )
         if dl.action == "failed" or not tmp.is_file() or tmp.stat().st_size < 1000:
             return TfPreviewResult(
@@ -1125,8 +1271,8 @@ def tf_preview_frame(
                     f"playback: {play_err}; download: {dl.error or 'incomplete'}"
                 ),
             )
-        _jpeg_from_downloaded_file(tmp, dest_jpg, ffmpeg=ffmpeg)
-        accept_or_reject_jpeg(dest_jpg, ffmpeg=ffmpeg)
+        _jpeg_from_downloaded_file(tmp, dest_jpg, ffmpeg=ff)
+        # Trust container decode; skip expensive second RGB green-pass
         return TfPreviewResult(
             item=item,
             action="previewed",
@@ -1147,11 +1293,13 @@ def tf_preview_frame(
             error=f"playback: {play_err}; download-fallback: {e}",
         )
     finally:
-        try:
-            if tmp.is_file():
-                tmp.unlink()
-        except OSError:
-            pass
+        # Keep MOV when keep_download_path was set; only drop ephemeral tmp.
+        if keep is None:
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
 
 
 def resolve_tf_item(

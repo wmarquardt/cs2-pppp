@@ -84,6 +84,20 @@ def test_strip_media_headers_and_keyframe_au():
     assert b"IDRDATA" in au
     assert b"\x01\xaf\xaf\xaf" not in au
 
+    # multi-slice: trailing TRAIL VCL (type 1) must be kept with the IDR
+    multi = (
+        nal(32, b"V")
+        + nal(33, b"S")
+        + nal(34, b"P")
+        + nal(19, b"IDR1")
+        + nal(1, b"SLICE2")
+        + nal(1, b"SLICE3")
+        + nal(32, b"NEXTVPS")  # next AU — stop before this
+    )
+    au2 = extract_hevc_keyframe_au(multi)
+    assert b"IDR1" in au2 and b"SLICE2" in au2 and b"SLICE3" in au2
+    assert b"NEXTVPS" not in au2
+
 
 def test_resolve_tf_item():
     items = [
