@@ -40,6 +40,7 @@ from .errors import (
 from .framing import encode_json, extract_json_strings
 from .initstring import DecodedInit, decode_init_string
 from .probe import probe
+from .factory import APPOINT_FACTORY, FactoryResult, factory_reset
 from .reboot import APPOINT_REBOOT, RebootResult, parse_appoint_reply, reboot
 from .session import PeerEndpoint, PpppSession
 from .status import ProbeResult, Status
@@ -66,7 +67,7 @@ from .tf import (
 )
 from ._tables import clear_tables, configure_tables
 
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 
 __all__ = [
     "__version__",
@@ -84,11 +85,14 @@ __all__ = [
     "parse_login_dev",
     "parse_dev_info",
     "peer_endpoint",
-    # soft reboot (AppointDev state=1)
+    # AppointDev (state=1 reboot, state=2 factory reset)
     "reboot",
     "RebootResult",
     "APPOINT_REBOOT",
     "parse_appoint_reply",
+    "factory_reset",
+    "FactoryResult",
+    "APPOINT_FACTORY",
     # TF / SD card
     "TfVideoItem",
     "TfDownloadResult",

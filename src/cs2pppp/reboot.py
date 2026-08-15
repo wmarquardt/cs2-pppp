@@ -1,7 +1,7 @@
 """Soft reboot via CS2 app JSON ``AppointDev`` ``state=1``.
 
-Does **not** wipe pairing or Wi‑Fi. Factory reset (``AppointDev`` ``state=2``)
-is a different command and is not implemented here.
+Does **not** wipe pairing or Wi‑Fi. Factory reset is
+:func:`cs2pppp.factory.factory_reset` (``state=2``).
 
 This module is protocol-only: caller supplies an already-open
 :class:`~cs2pppp.session.PpppSession`. No directory presets, no CLI.
@@ -19,6 +19,8 @@ from .session import PpppSession
 
 # Soft-reboot state used by CS2-style app JSON (not factory reset).
 APPOINT_REBOOT = 1
+# Shared with :mod:`cs2pppp.factory` (wipe). Keep the constants together.
+APPOINT_FACTORY = 2
 
 
 @dataclass
@@ -64,31 +66,34 @@ def _first_appoint_raw(replies: List[str]) -> Optional[str]:
     return replies[0] if replies else None
 
 
-def reboot(
+def appoint(
     session: PpppSession,
+    state: int,
     *,
     password: Optional[str] = None,
     read_timeout: float = 10.0,
     check_alive: bool = True,
+    refuse_loopback: str = "loopback session — refusing",
 ) -> RebootResult:
-    """Fire ``AppointDev`` ``state=1`` on an **already open** session.
+    """Fire ``AppointDev`` with ``state`` on an **already open** session.
 
     Does not open/close the session. Optional ``password`` becomes the ``pwd``
-    field; omit it (default) — tested firmwares accept reboot without ``pwd``.
+    field; omit it (default) — tested firmwares accept AppointDev without
+    ``pwd``.
 
     ``likely_ok`` is True when the device answers AppointDev, the channel dies
-    mid-flight (typical while rebooting), or a follow-up GetDevInfo is silent.
+    mid-flight (typical while restarting), or a follow-up GetDevInfo is silent.
     """
     result = RebootResult()
     if getattr(session, "loopback", False):
-        result.error = "loopback session — refusing reboot"
+        result.error = refuse_loopback
         result.notes.append("loopback")
         return result
     if not getattr(session, "sock", None) or not getattr(session, "peer", None):
         result.error = "session not open"
         return result
 
-    obj: Dict[str, Any] = {"cmd": "AppointDev", "state": APPOINT_REBOOT}
+    obj: Dict[str, Any] = {"cmd": "AppointDev", "state": state}
     if password is not None:
         obj["pwd"] = password
 
@@ -121,7 +126,9 @@ def reboot(
 
     if check_alive:
         try:
-            post = session.command({"cmd": "GetDevInfo"}, read_timeout=min(3.0, read_timeout))
+            post = session.command(
+                {"cmd": "GetDevInfo"}, read_timeout=min(3.0, read_timeout)
+            )
         except Exception:
             post = []
         if not post:
@@ -133,9 +140,36 @@ def reboot(
     return result
 
 
+def reboot(
+    session: PpppSession,
+    *,
+    password: Optional[str] = None,
+    read_timeout: float = 10.0,
+    check_alive: bool = True,
+) -> RebootResult:
+    """Fire ``AppointDev`` ``state=1`` on an **already open** session.
+
+    Does not open/close the session. Optional ``password`` becomes the ``pwd``
+    field; omit it (default) — tested firmwares accept reboot without ``pwd``.
+
+    ``likely_ok`` is True when the device answers AppointDev, the channel dies
+    mid-flight (typical while rebooting), or a follow-up GetDevInfo is silent.
+    """
+    return appoint(
+        session,
+        APPOINT_REBOOT,
+        password=password,
+        read_timeout=read_timeout,
+        check_alive=check_alive,
+        refuse_loopback="loopback session — refusing reboot",
+    )
+
+
 __all__ = [
+    "APPOINT_FACTORY",
     "APPOINT_REBOOT",
     "RebootResult",
+    "appoint",
     "parse_appoint_reply",
     "reboot",
 ]

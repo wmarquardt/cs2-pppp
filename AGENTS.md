@@ -5,7 +5,7 @@
 `cs2pppp` is a **stdlib-only** Python client for the CS2 Network PPPP wire
 protocol and CS2-style app JSON. Callers use it to probe DIDs, open UDP
 sessions, and talk JSON on the DRW command channel (login, device info,
-TF/SD listing and download, soft reboot, optional snapshot).
+TF/SD listing and download, soft reboot, factory reset, optional snapshot).
 
 Directory servers, InitStrings, and protocol byte tables are **always
 injected by the caller**. This package ships none of them.
@@ -42,7 +42,7 @@ knows their own servers, tables, and credentials.
 ## In scope
 
 - Wire formats: directory probe, PPPP session, DRW, CS2-style app JSON
-- High-level helpers that speak those formats (`Device`, `reboot`, TF)
+- High-level helpers that speak those formats (`Device`, `reboot`, `factory_reset`, TF)
 - Caller-injected config (`Cs2Client(servers=...)`, `configure_tables`)
 - DID **format** helpers (`parse_did`, `PREFIX_MAP`) — identity encoding,
   not a server list and not a DID generator

@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from .did import to_real
 from .errors import AuthError, SessionError
+from .factory import FactoryResult, factory_reset as fire_factory
 from .reboot import RebootResult, reboot as fire_reboot
 from .session import PpppSession
 from .sessions import SessionStatus, collect_session_status
@@ -146,6 +147,24 @@ class Device:
         """
         pwd = self.password if password is None else password
         return fire_reboot(
+            self.session,
+            password=pwd if pwd else None,
+            read_timeout=read_timeout,
+        )
+
+    def factory_reset(
+        self,
+        *,
+        password: Optional[str] = None,
+        read_timeout: float = 10.0,
+    ) -> FactoryResult:
+        """Factory reset (``AppointDev`` ``state=2``). Wipes settings / Wi‑Fi.
+
+        Session must already be open. Does **not** prompt. Empty ``password``
+        omits the ``pwd`` field (tested firmwares accept reset without it).
+        """
+        pwd = self.password if password is None else password
+        return fire_factory(
             self.session,
             password=pwd if pwd else None,
             read_timeout=read_timeout,
