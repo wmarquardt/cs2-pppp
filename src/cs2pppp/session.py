@@ -122,6 +122,21 @@ class PpppSession:
         if not self.servers:
             raise ConfigError("no directory servers supplied")
 
+        # Allow re-open after close() (preview head/tail uses a fresh session).
+        if self.sock is not None:
+            try:
+                self.close()
+            except Exception:
+                pass
+
+        self.peer = None
+        self.our_wan = None
+        self.drw_index = 0
+        self.punch_targets = []
+        self.loopback = False
+        self._via = ""
+        self._rsr_marker = b""
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
         self._uid = pack_uid(self.real_did)
@@ -660,6 +675,10 @@ class PpppSession:
             except OSError:
                 pass
         self.sock = None
+        self.peer = None
+        self.our_wan = None
+        self.loopback = False
+        self._via = ""
 
     def __enter__(self) -> "PpppSession":
         return self
