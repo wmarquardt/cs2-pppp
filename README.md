@@ -104,6 +104,7 @@ with client.device("G100000ZKMNP", password="123456") as dev:
     # dev.snapshot("out.jpg")      # optional; needs ffmpeg on PATH
     # files = dev.list_tf_videos() # TF/SD card recordings
     # dev.download_tf_file(files[0], "clip.mov")
+    # dev.reboot()                 # AppointDev state=1; does not wipe Wi‑Fi
 
 # Low-level session
 with client.session("G100000ZKMNP") as sess:
@@ -111,6 +112,8 @@ with client.session("G100000ZKMNP") as sess:
     replies = sess.request_json({"cmd": "GetDevInfo"})
     sess.send_json({"cmd": "LoginDev", "pwd": "123456"})
     raw = sess.recv(timeout=2.0)
+    from cs2pppp import reboot
+    reboot(sess)                   # same as dev.reboot(); no factory reset
 ```
 
 ## TF / SD card videos

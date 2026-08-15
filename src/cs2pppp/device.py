@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from .did import to_real
 from .errors import AuthError, SessionError
+from .reboot import RebootResult, reboot as fire_reboot
 from .session import PpppSession
 from .sessions import SessionStatus, collect_session_status
 from .tf import (
@@ -131,6 +132,24 @@ class Device:
     def command(self, obj: Dict[str, Any], **kw) -> List[Dict[str, Any]]:
         """Send an arbitrary app-channel command; parsed JSON replies."""
         return self.session.request_json(obj, **kw)
+
+    def reboot(
+        self,
+        *,
+        password: Optional[str] = None,
+        read_timeout: float = 10.0,
+    ) -> RebootResult:
+        """Soft reboot (``AppointDev`` ``state=1``). Does not wipe Wi‑Fi.
+
+        Session must already be open. Empty ``password`` omits the ``pwd``
+        field (tested firmwares accept reboot without it).
+        """
+        pwd = self.password if password is None else password
+        return fire_reboot(
+            self.session,
+            password=pwd if pwd else None,
+            read_timeout=read_timeout,
+        )
 
     # --- TF / SD card recordings ------------------------------------------
 
@@ -253,6 +272,7 @@ __all__ = [
     "Device",
     "INFO_COMMANDS",
     "SessionStatus",
+    "RebootResult",
     "TfVideoItem",
     "TfDownloadResult",
     "TfPreviewResult",
