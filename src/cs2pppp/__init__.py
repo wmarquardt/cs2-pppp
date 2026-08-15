@@ -42,6 +42,15 @@ from .initstring import DecodedInit, decode_init_string
 from .probe import probe
 from .session import PeerEndpoint, PpppSession
 from .status import ProbeResult, Status
+from .sessions import (
+    CLIENT_LIST_PROBES,
+    CmdProbe,
+    SessionStatus,
+    collect_session_status,
+    parse_dev_info,
+    parse_login_dev,
+    peer_endpoint,
+)
 from .tf import (
     TfDownloadResult,
     TfPreviewResult,
@@ -66,6 +75,14 @@ __all__ = [
     "Device",
     "PpppSession",
     "PeerEndpoint",
+    # session status (LoginDev connectNum + path peer)
+    "SessionStatus",
+    "CmdProbe",
+    "CLIENT_LIST_PROBES",
+    "collect_session_status",
+    "parse_login_dev",
+    "parse_dev_info",
+    "peer_endpoint",
     # TF / SD card
     "TfVideoItem",
     "TfDownloadResult",

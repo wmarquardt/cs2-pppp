@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .did import to_real
 from .errors import AuthError, SessionError
 from .session import PpppSession
+from .sessions import SessionStatus, collect_session_status
 from .tf import (
     TfDownloadResult,
     TfPreviewResult,
@@ -96,6 +97,26 @@ class Device:
                 return r
         # No explicit LoginDev reply: treat silence as inconclusive, not success.
         raise AuthError("LoginDev got no acknowledgement")
+
+    def session_status(
+        self,
+        *,
+        password: Optional[str] = None,
+        read_timeout: float = 5.0,
+        probe_client_list: bool = False,
+    ) -> SessionStatus:
+        """LoginDev ``connectNum`` + GetDevInfo.ip + this path peer.
+
+        Does not open the session (use :meth:`open` first). Viewer IP lists
+        are not part of the protocol; see :class:`SessionStatus`.
+        """
+        pwd = self.password if password is None else password
+        return collect_session_status(
+            self.session,
+            password=pwd or "",
+            read_timeout=read_timeout,
+            probe_client_list=probe_client_list,
+        )
 
     def get_info(self) -> Dict[str, Any]:
         """Collect device info from GetDevInfo (+ related), merged into one dict."""
@@ -231,6 +252,7 @@ def _extract_hevc(buf: bytes) -> bytes:
 __all__ = [
     "Device",
     "INFO_COMMANDS",
+    "SessionStatus",
     "TfVideoItem",
     "TfDownloadResult",
     "TfPreviewResult",
