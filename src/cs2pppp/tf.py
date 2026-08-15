@@ -56,6 +56,10 @@ CHANNEL_STREAM = 0
 CHANNEL_DOWNLOAD = 3
 NO_DATA_TIMEOUT_S = 12.0
 _HEVC_VPS = b"\x00\x00\x00\x01\x40"
+# Channel-3 DownloadFile wraps the MOV in fixed frames:
+#   a0 af af af | type/seq/… (25 bytes total header) | file bytes
+_DOWNLOAD_FRAME_MAGIC = b"\xa0\xaf\xaf\xaf"
+_DOWNLOAD_FRAME_HDR = 25
 
 ProgressCb = Callable[[int, int, float], None]  # written, total, rate_bps
 
@@ -344,6 +348,22 @@ def list_tf_videos(
     return all_items
 
 
+def _download_frame_payload(frame: bytes) -> Optional[Tuple[int, bytes]]:
+    """Parse one ``a0afafaf`` download frame → ``(seq, file_bytes)`` or None."""
+    if len(frame) <= _DOWNLOAD_FRAME_HDR:
+        return None
+    if not frame.startswith(_DOWNLOAD_FRAME_MAGIC):
+        # tolerate leading junk before magic
+        j = frame.find(_DOWNLOAD_FRAME_MAGIC)
+        if j < 0:
+            return None
+        frame = frame[j:]
+        if len(frame) <= _DOWNLOAD_FRAME_HDR:
+            return None
+    seq = struct.unpack_from("<I", frame, 8)[0]
+    return seq, frame[_DOWNLOAD_FRAME_HDR:]
+
+
 def download_tf_file(
     sess: PpppSession,
     item: TfVideoItem,
@@ -354,29 +374,52 @@ def download_tf_file(
     no_data_timeout: float = NO_DATA_TIMEOUT_S,
     progress: Optional[ProgressCb] = None,
     progress_interval: float = 0.4,
+    pos: int = 0,
+    max_bytes: Optional[int] = None,
 ) -> TfDownloadResult:
     """Download one TF file via ``DownloadFile`` + DRW channel 3.
 
-    Supports resume when ``dest`` already exists and is shorter than
-    ``item.size_bytes`` (uses ``pos``).
+    Channel-3 payloads are CS2-framed (``a0afafaf`` + 25-byte header + chunk).
+    This strips the framing and reassembles by sequence so the written file is
+    a real MOV (with ``moov``).
+
+    ``pos``: byte offset in the remote file (resume / range start).
+    ``max_bytes``: stop after this many **stripped** bytes (preview head/tail).
+    When set, does **not** wait for the full ``item.size_bytes``.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    start_pos = max(0, int(pos))
+    cap = int(max_bytes) if max_bytes is not None and max_bytes > 0 else None
 
-    start_pos = 0
-    mode = "wb"
-    if dest.is_file():
-        existing = dest.stat().st_size
-        if item.size_bytes > 0 and existing >= item.size_bytes:
+    if (
+        cap is None
+        and start_pos == 0
+        and dest.is_file()
+        and dest.stat().st_size > 32
+    ):
+        head = dest.read_bytes()[:12]
+        if (
+            item.size_bytes > 0
+            and dest.stat().st_size >= item.size_bytes
+            and head[4:8] == b"ftyp"
+        ):
             return TfDownloadResult(
                 item=item,
                 action="skipped",
                 path=str(dest.resolve()),
-                bytes_written=existing,
+                bytes_written=dest.stat().st_size,
             )
-        if existing > 0:
-            start_pos = existing
-            mode = "ab"
+        # stale framed/partial downloads — start clean
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+    elif dest.is_file() and (cap is not None or start_pos > 0):
+        try:
+            dest.unlink()
+        except OSError:
+            pass
 
     uid = int(user_id) if user_id is not None else random.randint(1, 100)
     pwd = password if password is not None else ""
@@ -405,106 +448,172 @@ def download_tf_file(
     time.sleep(0.15)
     _send_json(sess, start_req)
 
-    written = start_pos
-    total = item.size_bytes if item.size_bytes > 0 else 0
+    # seq -> payload (keep longest copy for retransmits). For small
+    # preview ranges we also append in arrival order as a fallback stream
+    # because mid-file seeks sometimes renumber seqs non-monotonically.
+    chunks: Dict[int, bytes] = {}
+    ordered: List[bytes] = []
+    seen_seq: set = set()
+    # progress total: remaining file or cap
+    if cap is not None:
+        total = cap
+    elif item.size_bytes > 0 and start_pos < item.size_bytes:
+        total = item.size_bytes - start_pos
+    elif item.size_bytes > 0:
+        total = item.size_bytes
+    else:
+        total = 0
     t0 = time.time()
     last_data = t0
     last_prog = 0.0
-    action = "resumed" if start_pos > 0 else "downloaded"
     err: Optional[str] = None
-    json_notes: List[str] = []
+    # reassembly buffer for partial DRW payloads
+    rx_buf = bytearray()
+
+    def stripped_size() -> int:
+        if cap is not None:
+            return sum(len(v) for v in ordered)
+        return sum(len(v) for v in chunks.values())
 
     try:
-        with dest.open(mode) as fh:
-            while True:
-                now = time.time()
-                if now - last_data > no_data_timeout:
-                    if written > start_pos:
-                        if total > 0 and written >= total:
-                            break
-                        err = (
-                            f"no channel-3 data for {no_data_timeout:.0f}s "
-                            f"(have {written}/{total or '?'} bytes)"
-                        )
-                    else:
-                        err = (
-                            f"no channel-3 data for {no_data_timeout:.0f}s "
-                            "(DownloadFile may need password or path invalid)"
-                        )
-                    break
-                if total > 0 and written >= total:
-                    break
-
-                if now - last_prog >= progress_interval and progress is not None:
-                    elapsed = max(now - t0, 1e-3)
-                    rate = (written - start_pos) / elapsed
-                    progress(written, total, rate)
-                    last_prog = now
-
-                sess._send(header(MSG_ALIVE, 0), (sess.peer.ip, sess.peer.port))  # noqa: SLF001
-                for data, addr in sess._recv(0.35):  # noqa: SLF001
-                    if len(data) < 2 or data[0] != MAGIC:
-                        continue
-                    t = data[1]
-                    if t == MSG_ALIVE:
-                        sess._send(header(MSG_ALIVE_ACK, 0), addr)  # noqa: SLF001
-                        continue
-                    if t == MSG_ALIVE_ACK:
-                        continue
-                    if t in (
-                        MSG_RLY_RDY,
-                        MSG_RLY_PKT,
-                        MSG_P2P_RDY,
-                        MSG_PUNCH_PKT,
-                        MSG_DRW_ACK,
-                    ):
-                        continue
-                    if t == MSG_DRW and len(data) >= 8:
-                        sess.peer = PeerEndpoint(addr[0], addr[1])
-                        ch = data[5]
-                        di = struct.unpack_from(">H", data, 6)[0]
-                        ack = (
-                            header(MSG_DRW_ACK, 6)
-                            + bytes([DRW_MAGIC, ch, 0x00, 0x01])
-                            + struct.pack(">H", di)
-                        )
-                        sess._send(ack, addr)  # noqa: SLF001
-                        payload = data[8:]
-                        if ch == CHANNEL_DOWNLOAD and payload:
-                            fh.write(payload)
-                            written += len(payload)
-                            last_data = time.time()
-                            if total > 0 and written >= total:
-                                break
-                        else:
-                            for j in extract_json_strings(payload):
-                                if j not in json_notes:
-                                    json_notes.append(j)
-                                try:
-                                    jo = json.loads(j)
-                                except json.JSONDecodeError:
-                                    continue
-                                if (
-                                    isinstance(jo, dict)
-                                    and jo.get("cmd") == "DownloadFile"
-                                ):
-                                    st = jo.get("state")
-                                    if st is not None:
-                                        try:
-                                            si = int(st)
-                                        except (TypeError, ValueError):
-                                            si = 0
-                                        if si < 0 and written == start_pos:
-                                            err = f"DownloadFile state={si}"
-                                            last_data = 0
-                    elif t == MSG_CLOSE:
-                        err = err or "session closed by peer"
-                        last_data = 0
+        while True:
+            now = time.time()
+            have = stripped_size()
+            # preview / range: enough stripped bytes
+            if cap is not None and have >= cap:
+                break
+            if now - last_data > no_data_timeout:
+                if have > 0:
+                    # idle after progress: accept if we have enough or no total
+                    if cap is not None or total <= 0 or have >= total * 0.98:
                         break
-                if err and written == start_pos:
+                    err = (
+                        f"no channel-3 data for {no_data_timeout:.0f}s "
+                        f"(have {have}/{total or '?'} bytes stripped)"
+                    )
+                else:
+                    err = (
+                        f"no channel-3 data for {no_data_timeout:.0f}s "
+                        "(DownloadFile may need password or path invalid)"
+                    )
+                break
+            # complete: stripped file reached declared size (full download)
+            if cap is None and total > 0 and have >= total:
+                break
+            # hard cap from size (~25 KiB/s floor on bad relays) + slack
+            if cap is not None:
+                max_time = max(45.0, (cap / 20_000.0) + 30.0)
+            elif total > 0:
+                max_time = max(180.0, (total / 25_000.0) + 90.0)
+            else:
+                max_time = max(no_data_timeout * 30, 300.0)
+            if (now - t0) > max_time:
+                if have > 0:
                     break
-                if total > 0 and written >= total:
+                err = f"download timed out after {now - t0:.0f}s"
+                break
+
+            if now - last_prog >= progress_interval and progress is not None:
+                elapsed = max(now - t0, 1e-3)
+                progress(have, total, have / elapsed)
+                last_prog = now
+
+            sess._send(header(MSG_ALIVE, 0), (sess.peer.ip, sess.peer.port))  # noqa: SLF001
+            for data, addr in sess._recv(0.35):  # noqa: SLF001
+                if len(data) < 2 or data[0] != MAGIC:
+                    continue
+                t = data[1]
+                if t == MSG_ALIVE:
+                    sess._send(header(MSG_ALIVE_ACK, 0), addr)  # noqa: SLF001
+                    continue
+                if t == MSG_ALIVE_ACK:
+                    continue
+                if t in (
+                    MSG_RLY_RDY,
+                    MSG_RLY_PKT,
+                    MSG_P2P_RDY,
+                    MSG_PUNCH_PKT,
+                    MSG_DRW_ACK,
+                ):
+                    continue
+                if t == MSG_DRW and len(data) >= 8:
+                    sess.peer = PeerEndpoint(addr[0], addr[1])
+                    ch = data[5]
+                    di = struct.unpack_from(">H", data, 6)[0]
+                    ack = (
+                        header(MSG_DRW_ACK, 6)
+                        + bytes([DRW_MAGIC, ch, 0x00, 0x01])
+                        + struct.pack(">H", di)
+                    )
+                    sess._send(ack, addr)  # noqa: SLF001
+                    payload = data[8:]
+                    if ch == CHANNEL_DOWNLOAD and payload:
+                        rx_buf += payload
+                        # peel complete a0-frames from buffer
+                        while True:
+                            if len(rx_buf) < 4:
+                                break
+                            if not rx_buf.startswith(_DOWNLOAD_FRAME_MAGIC):
+                                j = bytes(rx_buf).find(_DOWNLOAD_FRAME_MAGIC)
+                                if j < 0:
+                                    # keep last 3 bytes (partial magic)
+                                    del rx_buf[: max(0, len(rx_buf) - 3)]
+                                    break
+                                del rx_buf[:j]
+                            # need next magic or enough bytes to guess frame end
+                            nxt = bytes(rx_buf).find(
+                                _DOWNLOAD_FRAME_MAGIC, 4
+                            )
+                            if nxt < 0:
+                                # wait for more unless buffer is huge
+                                if len(rx_buf) < 7000:
+                                    break
+                                # treat whole buffer as one frame
+                                frame = bytes(rx_buf)
+                                rx_buf.clear()
+                            else:
+                                frame = bytes(rx_buf[:nxt])
+                                del rx_buf[:nxt]
+                            parsed = _download_frame_payload(frame)
+                            if not parsed:
+                                continue
+                            seq, body = parsed
+                            if not body:
+                                continue
+                            prev = chunks.get(seq)
+                            if prev is None or len(body) > len(prev):
+                                chunks[seq] = body
+                            # arrival-order stream (preview ranges / flaky seq)
+                            if seq not in seen_seq:
+                                seen_seq.add(seq)
+                                ordered.append(body)
+                                last_data = time.time()
+                            elif len(body) > len(prev or b""):
+                                last_data = time.time()
+                    else:
+                        for j in extract_json_strings(payload):
+                            try:
+                                jo = json.loads(j)
+                            except json.JSONDecodeError:
+                                continue
+                            if (
+                                isinstance(jo, dict)
+                                and jo.get("cmd") == "DownloadFile"
+                            ):
+                                st = jo.get("state")
+                                try:
+                                    si = int(st) if st is not None else 0
+                                except (TypeError, ValueError):
+                                    si = 0
+                                if si < 0 and not chunks:
+                                    err = f"DownloadFile state={si}"
+                                    last_data = 0
+                elif t == MSG_CLOSE:
+                    err = err or "session closed by peer"
+                    last_data = 0
                     break
+            if err and not chunks:
+                break
     except OSError as e:
         err = f"write failed: {e}"
     finally:
@@ -512,44 +621,423 @@ def download_tf_file(
             _send_json(sess, stop_req)
         except Exception:
             pass
+        # flush trailing buffer as last frame
+        if rx_buf.startswith(_DOWNLOAD_FRAME_MAGIC):
+            parsed = _download_frame_payload(bytes(rx_buf))
+            if parsed:
+                seq, body = parsed
+                prev = chunks.get(seq)
+                if body and (prev is None or len(body) > len(prev)):
+                    chunks[seq] = body
+                if body and seq not in seen_seq:
+                    seen_seq.add(seq)
+                    ordered.append(body)
 
+    written = stripped_size()
     if progress is not None:
         elapsed = max(time.time() - t0, 1e-3)
-        progress(written, total, (written - start_pos) / elapsed)
+        progress(written, total, written / elapsed)
 
-    if err and written <= start_pos:
-        if dest.is_file() and dest.stat().st_size == 0:
+    if not chunks and not ordered:
+        if dest.is_file():
             try:
                 dest.unlink()
             except OSError:
                 pass
-        return TfDownloadResult(item=item, action="failed", path=None, error=err)
-
-    if err and total > 0 and written < total:
         return TfDownloadResult(
             item=item,
             action="failed",
-            path=str(dest.resolve()) if dest.is_file() else None,
-            bytes_written=written,
-            error=err,
+            path=None,
+            error=err or "no download frames received",
         )
 
-    if total > 0 and written < total and not err:
+    # Preview ranges: prefer arrival order (stable for mid-file seeks).
+    # Full download: sort by sequence for retransmit resilience.
+    if cap is not None and ordered:
+        blob = b"".join(ordered)
+    else:
+        blob = b"".join(chunks[s] for s in sorted(chunks))
+    try:
+        dest.write_bytes(blob)
+    except OSError as e:
+        return TfDownloadResult(
+            item=item, action="failed", path=None, error=f"write failed: {e}"
+        )
+
+    written = len(blob)
+    # Range/preview cap: any non-empty stripped payload is success.
+    if cap is not None:
+        if written < min(cap, 500) and err:
+            return TfDownloadResult(
+                item=item,
+                action="failed",
+                path=str(dest.resolve()) if written else None,
+                bytes_written=written,
+                error=err,
+            )
+        return TfDownloadResult(
+            item=item,
+            action="downloaded",
+            path=str(dest.resolve()),
+            bytes_written=written,
+            error=None,
+        )
+
+    # Full download: need moov (or nearly full size).
+    has_moov = b"moov" in blob
+    has_ftyp = b"ftyp" in blob[:64]
+    complete_enough = (
+        (total > 0 and written >= total * 0.98)
+        or (has_ftyp and has_moov and written > 10_000)
+    )
+
+    if not complete_enough:
+        msg = err or f"incomplete {written}/{total or '?'} bytes (stripped)"
+        if not has_moov:
+            msg += "; no moov atom (transfer cut short)"
         return TfDownloadResult(
             item=item,
             action="failed",
-            path=str(dest.resolve()) if dest.is_file() else None,
+            path=str(dest.resolve()),
             bytes_written=written,
-            error=f"incomplete {written}/{total} bytes",
+            error=msg,
         )
 
     return TfDownloadResult(
         item=item,
-        action=action,
+        action="downloaded",
         path=str(dest.resolve()),
         bytes_written=written,
         error=None,
     )
+
+
+def _iter_mp4_atoms(
+    data: bytes, start: int = 0, end: Optional[int] = None
+) -> List[Tuple[int, bytes, int, int]]:
+    """Return list of (offset, type4, header_len, size) for top-level atoms."""
+    end = len(data) if end is None else end
+    out: List[Tuple[int, bytes, int, int]] = []
+    off = start
+    while off + 8 <= end:
+        size = struct.unpack_from(">I", data, off)[0]
+        typ = data[off + 4 : off + 8]
+        hdr = 8
+        if size == 1 and off + 16 <= end:
+            size = struct.unpack_from(">Q", data, off + 8)[0]
+            hdr = 16
+        elif size == 0:
+            size = end - off
+        if size < hdr or off + size > end + 0:
+            # truncated atom — still yield remaining as best-effort
+            if size < hdr:
+                break
+            size = min(size, end - off)
+        out.append((off, typ, hdr, size))
+        off += size
+        if size == 0:
+            break
+    return out
+
+
+def _find_atom_payload(
+    data: bytes, name: bytes, *, start: int = 0, end: Optional[int] = None
+) -> Optional[Tuple[int, bytes]]:
+    """Depth-first search for atom ``name``; return (payload_abs_off, payload)."""
+    end = len(data) if end is None else end
+    for off, typ, hdr, size in _iter_mp4_atoms(data, start, end):
+        payload_off = off + hdr
+        payload = data[payload_off : off + size]
+        if typ == name:
+            return payload_off, payload
+        # container atoms
+        if typ in (
+            b"moov",
+            b"trak",
+            b"mdia",
+            b"minf",
+            b"stbl",
+            b"stsd",
+            b"udta",
+            b"mvex",
+        ):
+            # stsd has a 8-byte preamble before sample entries
+            sub_start = 0
+            if typ == b"stsd" and len(payload) >= 8:
+                sub_start = 8
+            # sample entry (avc1/hvc1/…) has 78-byte visual sample entry header-ish;
+            # walk nested by searching child atoms from sub_start
+            nested = _find_atom_payload(
+                payload, name, start=sub_start, end=len(payload)
+            )
+            if nested:
+                return payload_off + nested[0], nested[1]
+            # also try inside sample entries: skip 8 (stsd) + entry headers
+            if typ == b"stsd":
+                # brute: search for name anywhere as atom type
+                idx = 8
+                while idx + 8 <= len(payload):
+                    esize = struct.unpack_from(">I", payload, idx)[0]
+                    etyp = payload[idx + 4 : idx + 8]
+                    if esize < 8 or idx + esize > len(payload):
+                        break
+                    # inside visual sample entry, atoms start after ~86 bytes
+                    for skip in (8, 78, 86, 100):
+                        if skip < esize:
+                            nested = _find_atom_payload(
+                                payload[idx : idx + esize],
+                                name,
+                                start=skip,
+                                end=esize,
+                            )
+                            if nested:
+                                return (
+                                    payload_off + idx + nested[0],
+                                    nested[1],
+                                )
+                    idx += esize
+    return None
+
+
+def _extract_moov_atom(blob: bytes) -> Optional[bytes]:
+    """Full ``moov`` atom (size+type+body), even mid-buffer after mdat."""
+    i = 0
+    while True:
+        j = blob.find(b"moov", i)
+        if j < 4:
+            return None
+        size = struct.unpack_from(">I", blob, j - 4)[0]
+        start = j - 4
+        if 16 <= size <= len(blob) - start and size < 8_000_000:
+            atom = blob[start : start + size]
+            if b"mvhd" in atom or b"trak" in atom:
+                return atom
+        i = j + 4
+
+
+def _extract_moov_payload(blob: bytes) -> Optional[bytes]:
+    """Find a ``moov`` atom body even when it sits mid-buffer."""
+    found = _find_atom_payload(blob, b"moov")
+    if found:
+        return found[1]
+    atom = _extract_moov_atom(blob)
+    if atom and len(atom) > 8:
+        return atom[8:]
+    return None
+
+
+def _build_preview_mp4(head: bytes, moov_atom: bytes) -> Optional[bytes]:
+    """ftyp+partial mdat from head, then full moov — stco still valid in head."""
+    if len(head) < 40 or not moov_atom or len(moov_atom) < 16:
+        return None
+    if head[4:8] != b"ftyp":
+        return None
+    out = bytearray(head)
+    # Shrink mdat size to the bytes we actually have so the parser finds moov next.
+    if len(out) >= 40 and out[28:32] == b"mdat":
+        sz32 = struct.unpack_from(">I", out, 24)[0]
+        if sz32 == 1:
+            # largesize at offset 32
+            struct.pack_into(">Q", out, 32, len(out) - 24)
+        else:
+            struct.pack_into(">I", out, 24, len(out) - 24)
+    elif len(out) >= 32 and out[24:28] == b"mdat":
+        struct.pack_into(">I", out, 20, len(out) - 20)
+    out += moov_atom
+    return bytes(out)
+
+
+def _mp4_first_sample_annexb(
+    head: bytes, tail: bytes, file_size: int
+) -> Optional[Tuple[bytes, str]]:
+    """Build annex-B keyframe from preview head+tail ranges (moov often at end).
+
+    Returns ``(annexb, codec)`` or None.
+    """
+    moov = _extract_moov_payload(tail) or _extract_moov_payload(head)
+    if not moov:
+        return None
+
+    def _atom_body(buf: bytes, name: bytes) -> Optional[bytes]:
+        j = 0
+        while True:
+            i = buf.find(name, j)
+            if i < 4:
+                return None
+            sz = struct.unpack_from(">I", buf, i - 4)[0]
+            start = i - 4
+            if 8 <= sz <= len(buf) - start:
+                return buf[i + 4 : start + sz]
+            j = i + 4
+
+    stsz_p = _atom_body(moov, b"stsz")
+    stco_p = _atom_body(moov, b"stco")
+    co64_p = _atom_body(moov, b"co64")
+    stss_p = _atom_body(moov, b"stss")
+    if not stsz_p or (not stco_p and not co64_p):
+        return None
+    if len(stsz_p) < 12:
+        return None
+    sample_size = struct.unpack_from(">I", stsz_p, 4)[0]
+    sample_count = struct.unpack_from(">I", stsz_p, 8)[0]
+    if sample_count < 1:
+        return None
+
+    def _sample_size_at(i0: int) -> int:
+        if sample_size != 0:
+            return sample_size
+        o = 12 + 4 * i0
+        if o + 4 > len(stsz_p):
+            return 0
+        return struct.unpack_from(">I", stsz_p, o)[0]
+
+    # First sync sample (1-based); default to 1.
+    key_1based = 1
+    if stss_p and len(stss_p) >= 12:
+        n_sync = struct.unpack_from(">I", stss_p, 4)[0]
+        if n_sync >= 1:
+            key_1based = struct.unpack_from(">I", stss_p, 8)[0]
+
+    key_i = max(0, min(sample_count - 1, key_1based - 1))
+
+    # Chunk offsets — many cams use 1 sample per chunk.
+    if stco_p:
+        n_chunk = struct.unpack_from(">I", stco_p, 4)[0] if len(stco_p) >= 8 else 0
+        if n_chunk < 1 or len(stco_p) < 8 + 4 * n_chunk:
+            return None
+        # If one entry per sample, index by key; else use first chunk.
+        if n_chunk >= sample_count:
+            first_off = struct.unpack_from(">I", stco_p, 8 + 4 * key_i)[0]
+        else:
+            first_off = struct.unpack_from(">I", stco_p, 8)[0]
+            # advance by sample sizes for keys before key_i (single-chunk case)
+            for i in range(0, key_i):
+                first_off += _sample_size_at(i)
+    else:
+        assert co64_p is not None
+        n_chunk = struct.unpack_from(">I", co64_p, 4)[0] if len(co64_p) >= 8 else 0
+        if n_chunk < 1 or len(co64_p) < 8 + 8 * n_chunk:
+            return None
+        if n_chunk >= sample_count:
+            first_off = struct.unpack_from(">Q", co64_p, 8 + 8 * key_i)[0]
+        else:
+            first_off = struct.unpack_from(">Q", co64_p, 8)[0]
+            for i in range(0, key_i):
+                first_off += _sample_size_at(i)
+
+    if first_off < 0 or first_off >= len(head):
+        return None
+
+    # Pull from keyframe through as much of the head as we have.
+    # Multi-slice HEVC IDRs often span many samples; truncating early → green.
+    want = 0
+    for i in range(key_i, min(sample_count, key_i + 64)):
+        want += _sample_size_at(i)
+        if want >= 2_000_000:
+            break
+    if want < 100_000:
+        want = 1_000_000
+    # Prefer all remaining head bytes after the keyframe start.
+    take = min(len(head) - first_off, max(want, 500_000))
+    sample = head[first_off : first_off + take]
+    if len(sample) < 8:
+        return None
+
+    # parameter sets from decoder config
+    codec = "hevc"
+    params = b""
+    hvcc = _atom_body(moov, b"hvcC")
+    avcc = _atom_body(moov, b"avcC")
+    if hvcc:
+        params = _hvcc_to_annexb(hvcc)
+        codec = "hevc"
+    elif avcc:
+        params = _avcc_to_annexb(avcc)
+        codec = "h264"
+    else:
+        codec = "hevc" if (sample[4] >> 1) & 0x3F >= 16 else "h264"
+
+    # try length-size 4 then 2
+    annex_sample = _mp4_length_pref_to_annexb(sample, 4)
+    if not annex_sample or len(annex_sample) < 16:
+        annex_sample = _mp4_length_pref_to_annexb(sample, 2)
+    if not annex_sample:
+        return None
+    return params + annex_sample, codec
+
+
+def _mp4_length_pref_to_annexb(sample: bytes, length_size: int = 4) -> bytes:
+    out = bytearray()
+    i = 0
+    while i + length_size <= len(sample):
+        if length_size == 4:
+            n = struct.unpack_from(">I", sample, i)[0]
+        elif length_size == 2:
+            n = struct.unpack_from(">H", sample, i)[0]
+        else:
+            n = sample[i]
+        i += length_size
+        if n <= 0 or i + n > len(sample):
+            break
+        out += b"\x00\x00\x00\x01" + sample[i : i + n]
+        i += n
+    return bytes(out)
+
+
+def _avcc_to_annexb(avcc: bytes) -> bytes:
+    if len(avcc) < 7:
+        return b""
+    out = bytearray()
+    nalu_len = (avcc[4] & 3) + 1  # unused here
+    _ = nalu_len
+    n_sps = avcc[5] & 0x1F
+    o = 6
+    for _ in range(n_sps):
+        if o + 2 > len(avcc):
+            break
+        ln = struct.unpack_from(">H", avcc, o)[0]
+        o += 2
+        out += b"\x00\x00\x00\x01" + avcc[o : o + ln]
+        o += ln
+    if o >= len(avcc):
+        return bytes(out)
+    n_pps = avcc[o]
+    o += 1
+    for _ in range(n_pps):
+        if o + 2 > len(avcc):
+            break
+        ln = struct.unpack_from(">H", avcc, o)[0]
+        o += 2
+        out += b"\x00\x00\x00\x01" + avcc[o : o + ln]
+        o += ln
+    return bytes(out)
+
+
+def _hvcc_to_annexb(hvcc: bytes) -> bytes:
+    """Extract VPS/SPS/PPS NALs from HEVCDecoderConfigurationRecord."""
+    if len(hvcc) < 23:
+        return b""
+    out = bytearray()
+    # numOfArrays at offset 22
+    n_arrays = hvcc[22]
+    o = 23
+    for _ in range(n_arrays):
+        if o + 3 > len(hvcc):
+            break
+        # array_completeness(1) | reserved(1) | NAL_unit_type(6)
+        o += 1
+        n_nalus = struct.unpack_from(">H", hvcc, o)[0]
+        o += 2
+        for _ in range(n_nalus):
+            if o + 2 > len(hvcc):
+                return bytes(out)
+            ln = struct.unpack_from(">H", hvcc, o)[0]
+            o += 2
+            if o + ln > len(hvcc):
+                return bytes(out)
+            out += b"\x00\x00\x00\x01" + hvcc[o : o + ln]
+            o += ln
+    return bytes(out)
 
 
 # --- Playback / preview (channel 0) ---------------------------------------
@@ -877,13 +1365,17 @@ def stream_to_jpeg(
     if c == "h264":
         payload, fmt = clean, "h264"
     else:
-        # Require a full VPS+SPS+PPS+IDR AU — incomplete HEVC → green/corrupt JPEGs
+        # Prefer a full VPS+SPS+PPS+IDR AU; if the buffer already is a
+        # constructed keyframe (preview ranges), use it as-is.
         payload = extract_hevc_keyframe_au(clean)
         fmt = "hevc"
         if not payload:
-            raise SessionError(
-                "no complete HEVC keyframe (VPS+SPS+PPS+IDR) in stream"
-            )
+            if clean.startswith(b"\x00\x00\x00\x01") and len(clean) > 1024:
+                payload = clean
+            else:
+                raise SessionError(
+                    "no complete HEVC keyframe (VPS+SPS+PPS+IDR) in stream"
+                )
 
     if len(payload) < 64:
         raise SessionError("stream too short after strip/keyframe extract")
@@ -1100,204 +1592,265 @@ def tf_preview_frame(
     password: str = "",
     user_id: int = 1,
     pos: int = 0,
-    seconds: float = 3.0,
+    seconds: float = 2.0,
     ffmpeg: Optional[str] = None,
     download_fallback: bool = True,
-    max_download_bytes: Optional[int] = None,
-    download_timeout_s: float = 90.0,
+    max_download_bytes: Optional[int] = 3 * 1024 * 1024,
+    download_timeout_s: float = 12.0,
     local_file_candidates: Optional[List[Path]] = None,
     keep_download_path: Optional[Path] = None,
     skip_green_check: bool = False,
     progress: Optional[ProgressCb] = None,
+    prefer_stream: bool = False,
+    preview_head_bytes: int = 4 * 1024 * 1024,
+    preview_tail_bytes: int = 768 * 1024,
+    reopen: Optional[Callable[[], None]] = None,
 ) -> TfPreviewResult:
-    """One JPEG for a TF clip.
+    """One JPEG for a TF clip — **small transfer**, not full-file download.
 
     Order:
-      1. Reuse a complete local file if provided (instant thumbnail).
-      2. ``PlaybackFile`` + ch0, fail-fast if no keyframe (~``seconds``).
-      3. Optional full-file download fallback (needed on many cams where
-         PlaybackFile stream never yields a clean keyframe). Slow on relay.
+      1. Local complete MOV if present.
+      2. **One** head range (~1.5 MiB from byte 0).
+      3. **One** tail range (~2 MiB near EOF) for ``moov`` + first sample.
+      4. Optional short ``PlaybackFile`` stream (off by default).
 
-    ``max_download_bytes``: if set, skip download when ``item.size_bytes`` is
-    larger (``None`` = always allow — default). Pass a path in
-    ``keep_download_path`` to retain the MOV (e.g. under ``videos/``) so the
-    next preview hits step 1.
+    No multi-window retry thrashing. Full clip = ``download_tf_file``.
     """
     dest_jpg = Path(dest_jpg)
-    patch = item.patch
     raw = b""
     play_err: Optional[str] = None
     ff = ffmpeg or find_ffmpeg()
+    head_n = max(256 * 1024, int(preview_head_bytes))
+    tail_n = max(256 * 1024, int(preview_tail_bytes))
+    if max_download_bytes is not None and max_download_bytes > 0:
+        head_n = min(head_n, int(max_download_bytes))
+        tail_n = min(tail_n, int(max_download_bytes))
 
-    # --- 1) local cache (e.g. prior videos/ download) ----------------------
+    # --- 1) local cache ----------------------------------------------------
     if local_file_candidates:
         for cand in local_file_candidates:
             cp = Path(cand)
-            if (
-                cp.is_file()
-                and cp.stat().st_size >= max(1000, min(item.size_bytes or 0, 1000))
-                and (item.size_bytes <= 0 or cp.stat().st_size >= item.size_bytes * 0.95)
-            ):
+            if not cp.is_file() or cp.stat().st_size < 1000:
+                continue
+            if cp.read_bytes()[:4] == _DOWNLOAD_FRAME_MAGIC:
+                continue
+            try:
+                _jpeg_from_downloaded_file(cp, dest_jpg, ffmpeg=ff)
+                if not skip_green_check and jpeg_looks_corrupt(
+                    dest_jpg, ffmpeg=ff, green_ratio=0.45
+                ):
+                    dest_jpg.unlink(missing_ok=True)  # type: ignore[arg-type]
+                    raise SessionError("local thumbnail looked corrupt")
+                return TfPreviewResult(
+                    item=item,
+                    action="previewed",
+                    path=str(dest_jpg.resolve()),
+                    bytes_stream=cp.stat().st_size,
+                    codec="local",
+                )
+            except Exception:
                 try:
-                    _jpeg_from_downloaded_file(cp, dest_jpg, ffmpeg=ff)
-                    if not skip_green_check:
-                        # file-based decode is usually clean; light check only
-                        if jpeg_looks_corrupt(dest_jpg, ffmpeg=ff, green_ratio=0.45):
-                            dest_jpg.unlink(missing_ok=True)  # type: ignore[arg-type]
-                            raise SessionError("local thumbnail looked corrupt")
+                    if dest_jpg.is_file():
+                        dest_jpg.unlink()
+                except OSError:
+                    pass
+
+    if not download_fallback:
+        return TfPreviewResult(
+            item=item,
+            action="failed",
+            error="download fallback disabled and no local file",
+        )
+
+    # --- 2) ONE head + ONE tail (no retry thrash) -------------------------
+    tmp_dir = dest_jpg.parent
+    head_path = tmp_dir / (dest_jpg.stem + ".head.tmp")
+    tail_path = tmp_dir / (dest_jpg.stem + ".tail.tmp")
+    transferred = 0
+    try:
+        for p in (head_path, tail_path):
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+
+        if progress:
+            progress(0, head_n + tail_n, 0.0)
+
+        dl_head = download_tf_file(
+            sess,
+            item,
+            head_path,
+            password=password,
+            pos=0,
+            max_bytes=head_n,
+            no_data_timeout=max(download_timeout_s, 10.0),
+            progress=progress,
+        )
+        if (
+            dl_head.action == "failed"
+            or not head_path.is_file()
+            or head_path.stat().st_size < 500
+        ):
+            return TfPreviewResult(
+                item=item,
+                action="failed",
+                error=f"preview-head: {dl_head.error or 'empty'}",
+            )
+        head = head_path.read_bytes()
+        transferred += len(head)
+
+        # faststart: moov already in head
+        if b"moov" in head and b"ftyp" in head[:64]:
+            try:
+                _jpeg_from_downloaded_file(head_path, dest_jpg, ffmpeg=ff)
+                return TfPreviewResult(
+                    item=item,
+                    action="previewed",
+                    path=str(dest_jpg.resolve()),
+                    bytes_stream=transferred,
+                    codec="file-head",
+                )
+            except Exception as e:
+                play_err = f"head-decode: {e}"
+
+        size = item.size_bytes if item.size_bytes > 0 else 0
+        # Locate end of mdat from head (moov usually follows).
+        # ISO-BMFF: size==1 means a 64-bit largesize follows the type.
+        mdat_end = 0
+        if len(head) >= 40 and head[28:32] == b"mdat":
+            mdat_sz32 = struct.unpack_from(">I", head, 24)[0]
+            if mdat_sz32 == 1:
+                mdat_sz = struct.unpack_from(">Q", head, 32)[0]
+                if 16 < mdat_sz < 500_000_000:
+                    mdat_end = 24 + mdat_sz
+            elif 8 < mdat_sz32 < 500_000_000:
+                mdat_end = 24 + mdat_sz32
+        tail = b""
+        if size > head_n + 64 or mdat_end > head_n:
+            # ONE tail starting at moov (or near declared EOF).
+            if mdat_end > 0:
+                # start a few KB before moov; pull ~1–2 MiB of metadata
+                tail_pos = max(0, mdat_end - 4096)
+                want = min(tail_n, max(512 * 1024, (size - tail_pos) if size else tail_n))
+            else:
+                tail_pos = max(0, size - tail_n)
+                want = tail_n
+            # Mid-file DownloadFile pos is unreliable on the *same* session
+            # after a head range — reopen when the caller provides a hook.
+            if reopen is not None:
+                try:
+                    reopen()
+                except Exception as e:
+                    play_err = f"reopen: {e}"
+            else:
+                try:
+                    sess.command(
+                        {"cmd": "LoginDev", "pwd": password or ""},
+                        read_timeout=4.0,
+                        expect_cmd="LoginDev",
+                    )
+                except Exception:
+                    pass
+            dl_tail = download_tf_file(
+                sess,
+                item,
+                tail_path,
+                password=password,
+                pos=tail_pos,
+                max_bytes=want,
+                no_data_timeout=max(download_timeout_s, 10.0),
+                progress=progress,
+            )
+            if dl_tail.action != "failed" and tail_path.is_file():
+                tail = tail_path.read_bytes()
+                transferred += len(tail)
+
+        moov_atom = _extract_moov_atom(tail) if tail else None
+        # Best path: rebuild a tiny valid MP4 (head + moov) so ffmpeg demuxes
+        # the first frame properly (fixes multi-slice green bottoms).
+        if moov_atom:
+            mini = _build_preview_mp4(head, moov_atom)
+            if mini:
+                mini_path = tmp_dir / (dest_jpg.stem + ".mini.mp4")
+                try:
+                    mini_path.write_bytes(mini)
+                    _jpeg_from_downloaded_file(mini_path, dest_jpg, ffmpeg=ff)
+                    if (
+                        not skip_green_check
+                        and jpeg_looks_corrupt(
+                            dest_jpg, ffmpeg=ff, green_ratio=0.75
+                        )
+                        and dest_jpg.stat().st_size < 12_000
+                    ):
+                        raise SessionError("mini-mp4 jpeg empty/corrupt")
                     return TfPreviewResult(
                         item=item,
                         action="previewed",
                         path=str(dest_jpg.resolve()),
-                        bytes_stream=cp.stat().st_size,
-                        codec="local",
+                        bytes_stream=transferred,
+                        codec="range-mp4",
                     )
-                except Exception:
+                except Exception as e:
+                    play_err = f"mini-mp4: {e}"
                     try:
                         if dest_jpg.is_file():
                             dest_jpg.unlink()
                     except OSError:
                         pass
+                finally:
+                    try:
+                        if mini_path.is_file():
+                            mini_path.unlink()
+                    except OSError:
+                        pass
 
-    # --- 2) PlaybackFile (fast path) --------------------------------------
-    try:
-        playback_tf_file(
-            sess, patch, password=password, user_id=user_id, pos=0, state=0
+        annex = _mp4_first_sample_annexb(
+            head, tail, size or (len(head) + len(tail))
         )
-    except Exception:
-        pass
-    try:
-        drain_stream_channel(sess, channel=CHANNEL_STREAM, seconds=0.15)
-    except Exception:
-        pass
-
-    try:
-        playback_tf_file(
-            sess, patch, password=password, user_id=user_id, pos=pos, state=1
-        )
-        time.sleep(0.12)
-        playback_tf_file(
-            sess, patch, password=password, user_id=user_id, pos=pos, state=1
-        )
-        raw, _jsons, _n = collect_stream_channel(
-            sess,
-            channel=CHANNEL_STREAM,
-            seconds=max(seconds, 4.0),
-            stop_on_keyframe=True,
-            # need a full multi-slice IDR; fail-fast only if stream is garbage
-            give_up_no_keyframe_after=min(3.5, max(2.0, seconds * 0.75)),
-            min_keyframe_bytes=24_000,
-        )
-    except Exception as e:
-        play_err = str(e)
-        raw = b""
-    finally:
-        try:
-            playback_tf_file(
-                sess, patch, password=password, user_id=user_id, pos=0, state=0
-            )
-        except Exception:
-            pass
-        try:
-            drain_stream_channel(sess, channel=CHANNEL_STREAM, seconds=0.15)
-        except Exception:
-            pass
-
-    if raw:
-        clean = strip_media_frame_headers(raw)
-        codec = sniff_annexb_codec(clean) or sniff_annexb_codec(raw)
-        try:
-            stream_to_jpeg(raw, dest_jpg, ffmpeg=ff, codec=codec)
-            if not skip_green_check:
-                accept_or_reject_jpeg(dest_jpg, ffmpeg=ff)
-            return TfPreviewResult(
-                item=item,
-                action="previewed",
-                path=str(dest_jpg.resolve()),
-                bytes_stream=len(raw),
-                codec=codec or "hevc",
-            )
-        except Exception as e:
-            play_err = str(e)
+        if annex:
+            payload, codec = annex
             try:
-                if dest_jpg.is_file():
-                    dest_jpg.unlink()
-            except OSError:
-                pass
+                stream_to_jpeg(payload, dest_jpg, ffmpeg=ff, codec=codec)
+                if (
+                    not skip_green_check
+                    and jpeg_looks_corrupt(dest_jpg, ffmpeg=ff, green_ratio=0.85)
+                    and dest_jpg.stat().st_size < 15_000
+                ):
+                    raise SessionError("range jpeg looked empty/corrupt")
+                return TfPreviewResult(
+                    item=item,
+                    action="previewed",
+                    path=str(dest_jpg.resolve()),
+                    bytes_stream=transferred,
+                    codec=f"range-{codec}",
+                )
+            except Exception as e:
+                play_err = f"range-decode: {e}"
+                try:
+                    if dest_jpg.is_file():
+                        dest_jpg.unlink()
+                except OSError:
+                    pass
 
-    # --- 3) download fallback (full file; optional size skip) -------------
-    allow_dl = download_fallback
-    if allow_dl and max_download_bytes is not None:
-        if item.size_bytes > 0 and item.size_bytes > max_download_bytes:
-            allow_dl = False
-            play_err = (
-                f"{play_err or 'no keyframe'}; "
-                f"skip download ({item.size_bytes} B > max_download_bytes "
-                f"{max_download_bytes})"
-            )
-
-    if not allow_dl:
+        moov_ok = bool(moov_atom)
         return TfPreviewResult(
             item=item,
             action="failed",
-            bytes_stream=len(raw),
-            error=play_err or "playback preview failed",
-        )
-
-    keep = Path(keep_download_path) if keep_download_path else None
-    tmp = (
-        keep
-        if keep is not None
-        else dest_jpg.with_suffix(dest_jpg.suffix + ".dl.tmp")
-    )
-    # Resume if keep path is a partial previous download.
-    try:
-        if keep is None and tmp.is_file():
-            tmp.unlink()
-        dl = download_tf_file(
-            sess,
-            item,
-            tmp,
-            password=password,
-            no_data_timeout=max(download_timeout_s, 20.0),
-            progress=progress,
-        )
-        if dl.action == "failed" or not tmp.is_file() or tmp.stat().st_size < 1000:
-            return TfPreviewResult(
-                item=item,
-                action="failed",
-                bytes_stream=len(raw),
-                error=(
-                    f"playback: {play_err}; download: {dl.error or 'incomplete'}"
-                ),
-            )
-        _jpeg_from_downloaded_file(tmp, dest_jpg, ffmpeg=ff)
-        # Trust container decode; skip expensive second RGB green-pass
-        return TfPreviewResult(
-            item=item,
-            action="previewed",
-            path=str(dest_jpg.resolve()),
-            bytes_stream=tmp.stat().st_size,
-            codec="file",
-        )
-    except Exception as e:
-        try:
-            if dest_jpg.is_file():
-                dest_jpg.unlink()
-        except OSError:
-            pass
-        return TfPreviewResult(
-            item=item,
-            action="failed",
-            bytes_stream=len(raw),
-            error=f"playback: {play_err}; download-fallback: {e}",
+            bytes_stream=transferred,
+            error=(
+                f"preview failed after ~{transferred} B "
+                f"(head={len(head)} tail={len(tail)} moov={'yes' if moov_ok else 'no'}); "
+                f"{play_err or 'could not extract first frame'}. "
+                f"Use download_tf_file for the full file."
+            ),
         )
     finally:
-        # Keep MOV when keep_download_path was set; only drop ephemeral tmp.
-        if keep is None:
+        for p in (head_path, tail_path):
             try:
-                if tmp.is_file():
-                    tmp.unlink()
+                if p.is_file():
+                    p.unlink()
             except OSError:
                 pass
 

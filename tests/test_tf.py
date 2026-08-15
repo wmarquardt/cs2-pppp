@@ -99,6 +99,22 @@ def test_strip_media_headers_and_keyframe_au():
     assert b"NEXTVPS" not in au2
 
 
+def test_download_frame_payload_strip():
+    from cs2pppp.tf import _download_frame_payload, _DOWNLOAD_FRAME_HDR
+
+    # synthetic frame: magic + 25-byte hdr + "hello"
+    hdr = bytearray(25)
+    hdr[0:4] = b"\xa0\xaf\xaf\xaf"
+    # seq = 7 at offset 8 LE
+    hdr[8:12] = (7).to_bytes(4, "little")
+    frame = bytes(hdr) + b"hello-mov"
+    assert len(hdr) == _DOWNLOAD_FRAME_HDR
+    seq, body = _download_frame_payload(frame)
+    assert seq == 7
+    assert body == b"hello-mov"
+    assert _download_frame_payload(b"short") is None
+
+
 def test_resolve_tf_item():
     items = [
         TfVideoItem("a.MOV", "/app/sd/VIDEO/a.MOV", 10, 0),
