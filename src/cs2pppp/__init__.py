@@ -41,6 +41,15 @@ from .framing import encode_json, extract_json_strings
 from .initstring import DecodedInit, decode_init_string
 from .probe import probe
 from .factory import APPOINT_FACTORY, FactoryResult, factory_reset
+from .led import (
+    LED_OFF,
+    LED_ON,
+    SetLedResult,
+    ir_off,
+    ir_on,
+    parse_set_led_reply,
+    set_led,
+)
 from .reboot import APPOINT_REBOOT, RebootResult, parse_appoint_reply, reboot
 from .session import PeerEndpoint, PpppSession
 from .status import ProbeResult, Status
@@ -67,7 +76,7 @@ from .tf import (
 )
 from ._tables import clear_tables, configure_tables
 
-__version__ = "0.2.9"
+__version__ = "0.2.10"
 
 __all__ = [
     "__version__",
@@ -93,6 +102,14 @@ __all__ = [
     "factory_reset",
     "FactoryResult",
     "APPOINT_FACTORY",
+    # SetLed (IR / night illuminator)
+    "set_led",
+    "ir_on",
+    "ir_off",
+    "SetLedResult",
+    "LED_ON",
+    "LED_OFF",
+    "parse_set_led_reply",
     # TF / SD card
     "TfVideoItem",
     "TfDownloadResult",

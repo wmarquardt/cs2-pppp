@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .did import to_real
 from .errors import AuthError, SessionError
 from .factory import FactoryResult, factory_reset as fire_factory
+from .led import SetLedResult, set_led as fire_set_led
 from .reboot import RebootResult, reboot as fire_reboot
 from .session import PpppSession
 from .sessions import SessionStatus, collect_session_status
@@ -167,6 +168,19 @@ class Device:
         return fire_factory(
             self.session,
             password=pwd if pwd else None,
+            read_timeout=read_timeout,
+        )
+
+    def set_led(
+        self,
+        enabled: bool = True,
+        *,
+        read_timeout: float = 4.0,
+    ) -> SetLedResult:
+        """IR / night LED via ``SetLed`` ``ledstatus`` 1/0. One-way in the app."""
+        return fire_set_led(
+            self.session,
+            enabled,
             read_timeout=read_timeout,
         )
 
