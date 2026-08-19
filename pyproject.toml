@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cs2pppp"
-version = "0.2.10"
+version = "0.2.11"
 description = "Stdlib Python client for the CS2 PPPP wire protocol and app JSON, with caller-supplied directory servers (probe, session, TF list/download)."
 readme = "README.md"
 requires-python = ">=3.9"

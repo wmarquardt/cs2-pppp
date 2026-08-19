@@ -76,7 +76,7 @@ from .tf import (
 )
 from ._tables import clear_tables, configure_tables
 
-__version__ = "0.2.10"
+__version__ = "0.2.11"
 
 __all__ = [
     "__version__",

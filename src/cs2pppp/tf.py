@@ -1352,7 +1352,12 @@ def stream_to_jpeg(
     ffmpeg: Optional[str] = None,
     codec: Optional[str] = None,
 ) -> None:
-    """Decode first frame from annex-B stream to JPEG via ffmpeg."""
+    """Decode first frame from annex-B stream to JPEG via ffmpeg.
+
+    Feeds the **whole** stripped burst. Cutting to the first IDR NAL
+    (``extract_hevc_keyframe_au``) yields a half-picture when the
+    firmware repeats VPS/SPS/PPS before every slice of a tiled frame.
+    """
     ff = ffmpeg or find_ffmpeg()
     if not ff:
         raise SessionError(
@@ -1362,23 +1367,15 @@ def stream_to_jpeg(
         raise SessionError("empty stream")
     clean = strip_media_frame_headers(stream)
     c = codec or sniff_annexb_codec(clean) or sniff_annexb_codec(stream)
-    if c == "h264":
-        payload, fmt = clean, "h264"
-    else:
-        # Prefer a full VPS+SPS+PPS+IDR AU; if the buffer already is a
-        # constructed keyframe (preview ranges), use it as-is.
-        payload = extract_hevc_keyframe_au(clean)
-        fmt = "hevc"
-        if not payload:
-            if clean.startswith(b"\x00\x00\x00\x01") and len(clean) > 1024:
-                payload = clean
-            else:
-                raise SessionError(
-                    "no complete HEVC keyframe (VPS+SPS+PPS+IDR) in stream"
-                )
+    if c not in ("h264", "hevc"):
+        if b"\x00\x00\x00\x01" in clean[:64] or b"\x00\x00\x01" in clean[:32]:
+            c = "hevc"
+        else:
+            raise SessionError("no H.264/HEVC start codes in stream")
+    payload, fmt = clean, c
 
     if len(payload) < 64:
-        raise SessionError("stream too short after strip/keyframe extract")
+        raise SessionError("stream too short after strip")
 
     out_jpg = Path(out_jpg)
     out_jpg.parent.mkdir(parents=True, exist_ok=True)
@@ -1592,7 +1589,7 @@ def tf_preview_frame(
     password: str = "",
     user_id: int = 1,
     pos: int = 0,
-    seconds: float = 2.0,
+    seconds: float = 3.5,
     ffmpeg: Optional[str] = None,
     download_fallback: bool = True,
     max_download_bytes: Optional[int] = 3 * 1024 * 1024,
@@ -1601,7 +1598,7 @@ def tf_preview_frame(
     keep_download_path: Optional[Path] = None,
     skip_green_check: bool = False,
     progress: Optional[ProgressCb] = None,
-    prefer_stream: bool = False,
+    prefer_stream: bool = True,
     preview_head_bytes: int = 4 * 1024 * 1024,
     preview_tail_bytes: int = 768 * 1024,
     reopen: Optional[Callable[[], None]] = None,
@@ -1610,11 +1607,12 @@ def tf_preview_frame(
 
     Order:
       1. Local complete MOV if present.
-      2. **One** head range (~1.5 MiB from byte 0).
-      3. **One** tail range (~2 MiB near EOF) for ``moov`` + first sample.
-      4. Optional short ``PlaybackFile`` stream (off by default).
+      2. Short ``PlaybackFile`` burst on channel 0 (default; ``prefer_stream``).
+      3. Else one head range + optional moov tail via ``DownloadFile``.
 
-    No multi-window retry thrashing. Full clip = ``download_tf_file``.
+    Do not send ``LoginDev`` as a session keepalive — a failed login
+    leaves leftover JSON that makes the next ``GetTfVideoList`` look empty.
+    Full clip = ``download_tf_file``.
     """
     dest_jpg = Path(dest_jpg)
     raw = b""
@@ -1655,14 +1653,76 @@ def tf_preview_frame(
                 except OSError:
                     pass
 
+    # --- 2) PlaybackFile burst (channel 0, same as live OpenVideo) --------
+    if prefer_stream and seconds and seconds > 0:
+        dest_jpg.parent.mkdir(parents=True, exist_ok=True)
+        play_s = max(2.0, float(seconds))
+        n_drw = 0
+        try:
+            playback_tf_file(
+                sess, item.patch, password=password, user_id=user_id, pos=pos, state=1
+            )
+            raw, _js, n_drw = collect_stream_channel(
+                sess, seconds=play_s, stop_on_keyframe=False
+            )
+        except Exception as e:
+            play_err = f"playback: {e}"
+            raw = b""
+        finally:
+            try:
+                playback_tf_file(
+                    sess,
+                    item.patch,
+                    password=password,
+                    user_id=user_id,
+                    pos=pos,
+                    state=0,
+                )
+            except Exception:
+                pass
+            try:
+                drain_stream_channel(sess, seconds=0.45)
+            except Exception:
+                pass
+        if raw and len(raw) > 800:
+            try:
+                stream_to_jpeg(raw, dest_jpg, ffmpeg=ff)
+                if not skip_green_check and jpeg_looks_corrupt(
+                    dest_jpg, ffmpeg=ff, green_ratio=0.45
+                ):
+                    dest_jpg.unlink(missing_ok=True)  # type: ignore[arg-type]
+                    raise SessionError("playback jpeg looked corrupt")
+                sniffed = sniff_annexb_codec(strip_media_frame_headers(raw))
+                return TfPreviewResult(
+                    item=item,
+                    action="previewed",
+                    path=str(dest_jpg.resolve()),
+                    bytes_stream=len(raw),
+                    codec=f"play-{sniffed or 'hevc'}",
+                )
+            except Exception as e:
+                play_err = f"playback: {e}"
+                try:
+                    if dest_jpg.is_file():
+                        dest_jpg.unlink()
+                except OSError:
+                    pass
+        elif play_err is None:
+            play_err = f"playback silent (drw={n_drw} bytes={len(raw)})"
+        if play_err and reopen is not None:
+            try:
+                reopen()
+            except Exception as e:
+                play_err = f"{play_err}; reopen: {e}"
+
     if not download_fallback:
         return TfPreviewResult(
             item=item,
             action="failed",
-            error="download fallback disabled and no local file",
+            error=play_err or "download fallback disabled and no local file",
         )
 
-    # --- 2) ONE head + ONE tail (no retry thrash) -------------------------
+    # --- 3) ONE head + ONE tail (no retry thrash) -------------------------
     tmp_dir = dest_jpg.parent
     head_path = tmp_dir / (dest_jpg.stem + ".head.tmp")
     tail_path = tmp_dir / (dest_jpg.stem + ".tail.tmp")
@@ -1739,20 +1799,12 @@ def tf_preview_frame(
                 want = tail_n
             # Mid-file DownloadFile pos is unreliable on the *same* session
             # after a head range — reopen when the caller provides a hook.
+            # Do not LoginDev here: leftover login JSON poisons GetTfVideoList.
             if reopen is not None:
                 try:
                     reopen()
                 except Exception as e:
                     play_err = f"reopen: {e}"
-            else:
-                try:
-                    sess.command(
-                        {"cmd": "LoginDev", "pwd": password or ""},
-                        read_timeout=4.0,
-                        expect_cmd="LoginDev",
-                    )
-                except Exception:
-                    pass
             dl_tail = download_tf_file(
                 sess,
                 item,

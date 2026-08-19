@@ -98,6 +98,23 @@ def test_strip_media_headers_and_keyframe_au():
     assert b"IDR1" in au2 and b"SLICE2" in au2 and b"SLICE3" in au2
     assert b"NEXTVPS" not in au2
 
+    # Firmware that repeats VPS before every slice: extractor keeps the
+    # *latest* VPS+one-slice AU, so TILE0 is dropped. stream_to_jpeg
+    # must feed the whole burst or the JPEG is half a picture.
+    tiled = (
+        nal(32, b"V")
+        + nal(33, b"S")
+        + nal(34, b"P")
+        + nal(19, b"TILE0")
+        + nal(32, b"V2")
+        + nal(33, b"S2")
+        + nal(34, b"P2")
+        + nal(19, b"TILE1")
+    )
+    au3 = extract_hevc_keyframe_au(tiled)
+    assert b"TILE1" in au3
+    assert b"TILE0" not in au3
+
 
 def test_download_frame_payload_strip():
     from cs2pppp.tf import _download_frame_payload, _DOWNLOAD_FRAME_HDR
@@ -113,6 +130,16 @@ def test_download_frame_payload_strip():
     assert seq == 7
     assert body == b"hello-mov"
     assert _download_frame_payload(b"short") is None
+
+
+def test_preview_defaults_prefer_stream():
+    import inspect
+
+    from cs2pppp.tf import tf_preview_frame
+
+    params = inspect.signature(tf_preview_frame).parameters
+    assert params["prefer_stream"].default is True
+    assert params["seconds"].default == 3.5
 
 
 def test_resolve_tf_item():
